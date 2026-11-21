@@ -5,10 +5,13 @@
 import pytest
 import torch
 from executorch.backends.cuda.nvfp4_tensor import CudaNVFP4Tensor
-from executorch.backends.cuda.tests.nvfp4_test_utils import weight
+from executorch.backends.cuda.tests.nvfp4_test_utils import shards, weight
 from executorch.backends.cuda.triton.kernels.nvfp4_quantized_gemm import (
     _has_native_fp4_conversion,
+    nvfp4_embedding,
+    nvfp4_gemv,
     nvfp4_quantize_activation,
+    nvfp4_w4a16,
     nvfp4_w4a4,
 )
 
@@ -18,6 +21,21 @@ pytestmark = pytest.mark.skipif(
     or torch.cuda.get_device_capability() < (8, 9),
     reason="NVIDIA CUDA with native E4M3 (SM89+) required",
 )
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 71, 192), (2, 97, 80), (4, 65, 256), (16, 71, 192), (37, 97, 80)]
+)
+def test_w4a16(m, n, k):
+    w = weight(n, k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    expected = (x.float() @ w.dequantize().float().T).to(x.dtype)
+    actual = (
+        nvfp4_gemv(x, w.qdata, w.scale, w.per_tensor_scale, split_k=4)
+        if m <= 4
+        else nvfp4_w4a16(x, w.qdata, w.scale, w.per_tensor_scale)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.015)
 
 
 @pytest.mark.parametrize("static", [0.0, 0.001])
@@ -95,20 +113,65 @@ def test_native_w4a4(m, n, k):
 
 
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8, 16, 32])
-@pytest.mark.parametrize("mode", ["w4a4"])
+@pytest.mark.parametrize("mode", ["w4a4", "w4a16"])
 def test_gemm_split_k(mode, split_k):
     if mode == "w4a4" and not _has_native_fp4_conversion():
         pytest.skip("native FP4 required")
     k = 4224 if split_k == 32 else 2176
     w = weight(97, k)
     x = torch.randn(17, k, device="cuda", dtype=torch.bfloat16)
-    fn = nvfp4_w4a4
+    fn = nvfp4_w4a4 if mode == "w4a4" else nvfp4_w4a16
     expected = fn(x, w.qdata, w.scale, w.per_tensor_scale, split_k=1)
     actual = fn(x, w.qdata, w.scale, w.per_tensor_scale, split_k=split_k)
     torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.02)
 
 
-@pytest.mark.parametrize("mode", ["w4a4"])
+@pytest.mark.parametrize("m", [1, 2, 4])
+@pytest.mark.parametrize("split_k", [1, 2, 4, 8, 16, 32])
+def test_gemv_split_k(m, split_k):
+    # A non-power-of-two global scale checks rounding of the BF16 weights.
+    w = weight(71, 2176)
+    w = CudaNVFP4Tensor(w.qdata, w.scale, torch.tensor([0.37], device="cuda"))
+    x = torch.randn(m, 2176, device="cuda", dtype=torch.bfloat16)
+    expected = (x.float() @ w.dequantize().float().T).to(x.dtype)
+    actual = nvfp4_gemv(x, w.qdata, w.scale, w.per_tensor_scale, split_k=split_k)
+    torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.015)
+
+
+@pytest.mark.parametrize("split_k", [1, 2])
+@pytest.mark.parametrize("m", [1, 4, 37])
+def test_row_global_scale(m, split_k):
+    # Fused projections keep one global scale per output row.
+    w = CudaNVFP4Tensor.fuse_along_output(shards(192, device="cuda"))
+    assert w.per_tensor_scale.numel() == w.shape[0]
+    x = torch.randn(m, 192, device="cuda", dtype=torch.bfloat16)
+    expected = (x.float() @ w.dequantize().float().T).to(x.dtype)
+    launch = nvfp4_gemv if m <= 4 else nvfp4_w4a16
+    actual = launch(x, w.qdata, w.scale, w.per_tensor_scale, split_k=split_k)
+    torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.015)
+
+
+@pytest.mark.parametrize("split_k", [1, 4])
+@pytest.mark.parametrize("unit_scale", [False, True])
+def test_gemv_unit_scale(unit_scale, split_k):
+    w = weight(71, 192)
+    w = CudaNVFP4Tensor(
+        w.qdata, w.scale, torch.ones(1, device="cuda"), unit_scale=unit_scale
+    )
+    x = torch.randn(2, 192, device="cuda", dtype=torch.bfloat16)
+    expected = (x.float() @ w.dequantize().float().T).to(x.dtype)
+    actual = nvfp4_gemv(
+        x,
+        w.qdata,
+        w.scale,
+        w.per_tensor_scale,
+        split_k=split_k,
+        unit_scale=unit_scale,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.015)
+
+
+@pytest.mark.parametrize("mode", ["w4a4", "w4a16"])
 def test_split_workspace_exceeds_int32(mode):
     """Exercise a real-model workspace whose element offsets exceed 2**31."""
     import triton
@@ -148,8 +211,89 @@ def test_split_workspace_exceeds_int32(mode):
                 num_warps=4,
                 num_stages=3,
             )
+        else:
+            g = pts
+            kernels._w4a16.fn[(triton.cdiv(m, 64) * triton.cdiv(n, 64), split)](
+                x,
+                q,
+                s,
+                pts,
+                partial,
+                m,
+                n,
+                k,
+                split,
+                BM=64,
+                BN=64,
+                BK=64,
+                GROUP_M=1,
+                num_warps=4,
+                num_stages=3,
+            )
         kernels._reduce_partials[(triton.cdiv(m * n, 256),)](
             partial, g, pts, y, m, n, split, mode == "w4a4", 256
         )
         torch.cuda.synchronize()
         assert bool((y == 512).all())
+
+
+def test_embedding():
+    w = weight(97, 192)
+    ids = torch.tensor([[1, 3, 2, 1], [96, 0, 51, 72]], device="cuda")
+    torch.testing.assert_close(
+        nvfp4_embedding(ids, w.qdata, w.scale, w.per_tensor_scale, w.dtype),
+        w.dequantize()[ids],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_embedding_non_contiguous_ids():
+    w = weight(97, 192)
+    ids = torch.tensor([[1, 3, 2, 1], [96, 0, 51, 72]], device="cuda").T
+    torch.testing.assert_close(
+        nvfp4_embedding(ids, w.qdata, w.scale, w.per_tensor_scale, w.dtype),
+        w.dequantize()[ids],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_embedding_row_global_scale():
+    w = CudaNVFP4Tensor.fuse_along_output(shards(192, device="cuda"))
+    ids = torch.tensor([[0, 40, 96], [31, 50, 5]], device="cuda")
+    torch.testing.assert_close(
+        nvfp4_embedding(ids, w.qdata, w.scale, w.per_tensor_scale, torch.float32),
+        w.dequantize(torch.float32)[ids],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("bad", [-1, 97])
+def test_embedding_rejects_out_of_range_ids(bad):
+    w = weight(97, 192)
+    ids = torch.tensor([0, bad], device="cuda")
+    with pytest.raises(IndexError, match="out of range"):
+        nvfp4_embedding(ids, w.qdata, w.scale, w.per_tensor_scale, w.dtype)
+
+
+def test_w4a16_keeps_float32_output():
+    w = weight(97, 192)
+    x = torch.randn(17, 192, device="cuda")
+    out = nvfp4_w4a16(x, w.qdata, w.scale, w.per_tensor_scale)
+    assert out.dtype == torch.float32
+    assert (
+        nvfp4_gemv(x[:1], w.qdata, w.scale, w.per_tensor_scale).dtype == torch.float32
+    )
+
+
+def test_w4a16_output_offsets_exceed_int32():
+    m, n, k = 32834, 65536, 64
+    if torch.cuda.mem_get_info()[0] < 6 * 1024**3:
+        pytest.skip("Needs 6 GiB of free VRAM")
+    w = weight(n, k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    out = nvfp4_w4a16(x, w.qdata, w.scale, w.per_tensor_scale, split_k=1)
+    tail = nvfp4_w4a16(x[-8:], w.qdata, w.scale, w.per_tensor_scale, split_k=1)
+    torch.testing.assert_close(out[-8:], tail, rtol=0.01, atol=0.01)

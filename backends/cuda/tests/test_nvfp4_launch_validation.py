@@ -21,8 +21,11 @@ def test_activation_rejects_partial_k16_group(k):
         kernels.nvfp4_quantize_activation(x)
 
 
+@pytest.mark.parametrize(
+    "op", [kernels.nvfp4_w4a4, kernels.nvfp4_w4a16, kernels.nvfp4_gemv]
+)
 @pytest.mark.parametrize("invalid", ["k_mismatch", "scale_k", "strided"])
-def test_w4a4_rejects_malformed_operands(invalid):
+def test_rejects_malformed_operands(invalid, op):
     x = torch.empty((2, 64), dtype=torch.bfloat16)
     q = torch.empty((3, 32), dtype=torch.uint8)
     s = torch.empty((3, 4), dtype=torch.uint8)
@@ -33,7 +36,7 @@ def test_w4a4_rejects_malformed_operands(invalid):
     else:
         x = torch.empty((64, 2), dtype=torch.bfloat16).t()
     with pytest.raises(ValueError, match="NVFP4"):
-        kernels.nvfp4_w4a4(x, q, s, torch.ones(1))
+        op(x, q, s, torch.ones(1))
 
 
 def test_w4a4_requires_native_fp4():
@@ -62,6 +65,42 @@ def test_unsplit_launch_needs_no_partial_workspace():
 def test_gemm_still_rejects_illegal_short_k_split():
     with pytest.raises(InvalidLaunchParam, match="Illegal NVFP4 split-K"):
         kernels._check_split(80, 4)
+
+
+def test_gemv_workspace_rejected_before_output_allocation():
+    x = torch.empty((2, 80), dtype=torch.bfloat16)
+    q = torch.empty((3, 40), dtype=torch.uint8)
+    s = torch.empty((3, 5), dtype=torch.uint8)
+    pts = torch.ones(1)
+    with (
+        mock.patch.object(kernels, "_split_workspace_limit", return_value=1),
+        mock.patch.object(torch, "empty", side_effect=AssertionError("allocated")),
+        pytest.raises(InvalidLaunchParam, match="768 workspace bytes"),
+    ):
+        kernels._launch_gemv_impl(x, q, s, pts, split_k=32)
+
+
+@pytest.mark.parametrize("k", [16, 80, 192])
+@pytest.mark.parametrize("split", [4, 32])
+def test_gemv_keeps_legal_short_k_splits(k, split):
+    x = torch.empty((2, k), dtype=torch.bfloat16)
+    q = torch.empty((3, k // 2), dtype=torch.uint8)
+    s = torch.empty((3, k // 16), dtype=torch.uint8)
+    pts = torch.ones(1)
+    token = kernels._QUEUING_ONLY.set(True)
+    try:
+        with (
+            mock.patch.object(kernels, "_split_workspace_limit", return_value=2**20),
+            mock.patch.object(
+                kernels, "_has_native_fp4_conversion", return_value=False
+            ),
+            mock.patch.object(kernels, "launch_nvfp4_kernel") as launch,
+        ):
+            out = kernels._launch_gemv_impl(x, q, s, pts, split_k=split)
+        assert out.shape == (2, 3)
+        assert launch.call_args.args[2][-1] == split
+    finally:
+        kernels._QUEUING_ONLY.reset(token)
 
 
 @triton.jit
