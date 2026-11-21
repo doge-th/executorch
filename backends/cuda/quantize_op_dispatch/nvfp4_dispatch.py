@@ -26,6 +26,7 @@ from executorch.backends.cuda.quantize_op_dispatch._gemm_family_dispatch import 
 )
 from executorch.backends.cuda.triton.kernels.nvfp4_output import (
     NVFP4_DECODE_MAX_ROWS,
+    nvfp4_prefill_fp32_enabled,
     nvfp4_prefill_output_dtype,
 )
 from executorch.backends.cuda.triton.kernels.nvfp4_quantized_gemm import (
@@ -113,6 +114,105 @@ def nvfp4_auto_decode(
 ) -> torch.Tensor:
     """Compare NVFP4 GEMV and native FP4 in the AOTI launch context."""
     return _decode(x, qdata, scale, per_tensor_scale, act_scale, unit_scale)
+
+
+@autotune_launch_param(
+    "mode_split",
+    _MODE_SPLITS,
+    candidate_prepass=_compile_every_candidate_at_once,
+    do_bench=nvfp4_launch_bench,
+)
+def _prefill_gate_up(x, wq, ws, pts, act_scale, *, mode_split, output_dtype=None):
+    from executorch.backends.cuda.triton.kernels.nvfp4_gated_gemm import (
+        nvfp4_gate_up_epilogue,
+        nvfp4_w4a4_gate_up,
+    )
+    from executorch.backends.cuda.triton.kernels.nvfp4_quantized_gemm import nvfp4_w4a16
+
+    fp4, split = divmod(mode_split, _MODE_STRIDE)
+    if fp4:
+        return nvfp4_w4a4_gate_up(
+            x, wq, ws, pts, act_scale, split_k=split, output_dtype=output_dtype
+        )
+    return nvfp4_gate_up_epilogue(
+        nvfp4_w4a16(x, wq, ws, pts, split_k=split, output_dtype=output_dtype)
+    )
+
+
+@triton_op("triton::nvfp4_auto_gate_up_prefill", mutates_args={})
+def nvfp4_auto_gate_up_prefill(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    act_scale: float = 0.0,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
+    return _prefill_gate_up(x, qdata, scale, per_tensor_scale, act_scale, **kwargs)
+
+
+@torch.library.custom_op("triton::nvfp4_gated_linear", mutates_args={})
+def nvfp4_gated_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Gated prefill projection ``silu(x @ gate.T) * (x @ up.T)``.
+
+    ``weight`` rows are ``[gate; up]`` as produced by
+    ``CudaNVFP4Tensor.fuse_along_output([gate, up])`` (per-row global scales
+    in the same order), so N must be even. NVFP4 weights always take the
+    prefill kernels.
+
+    The weight stays an op argument until subclass decomposition: accessing a
+    parametrized NVFP4 weight's fields in a model forward makes Dynamo capture
+    anonymous constants, which cannot share GPU storage with the decode
+    method's named parameters.
+    """
+    projected = F.linear(x, weight)
+    half = projected.shape[-1] // 2
+    return F.silu(projected[..., :half]) * projected[..., half:]
+
+
+@nvfp4_gated_linear.register_fake
+def _fake_gated_linear(x, weight):
+    if weight.ndim != 2 or weight.shape[0] % 2 or x.shape[-1] != weight.shape[1]:
+        raise ValueError("NVFP4 gated linear requires even N and matching K")
+    return x.new_empty((*x.shape[:-1], weight.shape[0] // 2))
+
+
+@CudaNVFP4Tensor.implements([torch.ops.triton.nvfp4_gated_linear.default])
+def _gated_linear(func, types, args, kwargs):
+    x, weight = args
+    if weight.shape[0] % 2 or x.shape[-1] != weight.shape[1]:
+        raise ValueError("NVFP4 gated linear requires even N and matching K")
+    mode = os.environ.get("ET_CUDA_NVFP4_ACT", "auto")
+    if mode not in ("auto", "w4a4", "w4a16"):
+        raise ValueError("ET_CUDA_NVFP4_ACT must be auto, w4a4, or w4a16")
+    flat = x.reshape(-1, x.shape[-1]).contiguous()
+    if (
+        mode == "w4a16"
+        or (
+            x.dtype != torch.bfloat16
+            and not (x.dtype == torch.float32 and nvfp4_prefill_fp32_enabled())
+        )
+        or not can_launch_triton(flat)
+        or not _has_native_fp4()
+    ):
+        projected = F.linear(x, weight)
+        half = projected.shape[-1] // 2
+        return F.silu(projected[..., :half]) * projected[..., half:]
+    from executorch.backends.cuda.triton.kernels.nvfp4_gated_gemm import (
+        nvfp4_w4a4_gate_up,
+    )
+
+    operation = nvfp4_w4a4_gate_up if mode == "w4a4" else nvfp4_auto_gate_up_prefill
+    out = operation(
+        flat,
+        weight.qdata,
+        weight.scale,
+        weight.per_tensor_scale,
+        weight.act_per_tensor_scale or 0.0,
+        output_dtype=nvfp4_prefill_output_dtype(flat),
+    )
+    return out.reshape(*x.shape[:-1], weight.shape[0] // 2)
 
 
 @CudaNVFP4Tensor.implements([torch.ops.aten.linear.default])
